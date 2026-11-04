@@ -85,6 +85,18 @@ def enable():
         sp.check_call(["systemctl", "--user", "enable", "trakt-scrobbler"])
     else:
         win_startup_script = get_autostart_serv_path()
+        pythonw_path = Path(sys.executable).with_name("pythonw.exe")
+        if not pythonw_path.is_file():
+            raise FileNotFoundError(f"Cannot find pythonw.exe at {pythonw_path}")
+
+        run_command = sp.list2cmdline([cmd_path, "run"])
+        launcher_command = f'start "" /B {run_command}'
+        launcher_script = (
+            "import subprocess as sp; "
+            f"sp.Popen({launcher_command!r}, shell=True)"
+        )
+        launcher_arguments = sp.list2cmdline(["-c", launcher_script])
+
         try:
             import win32com.client
         except ImportError:
@@ -93,20 +105,18 @@ def enable():
         if win32com is not None:
             shell = win32com.client.Dispatch("WScript.Shell")
             shortcut = shell.CreateShortCut(str(win_startup_script))
-            shortcut.Targetpath = cmd_path
-            shortcut.Arguments = "run"
+            shortcut.Targetpath = str(pythonw_path)
+            shortcut.Arguments = launcher_arguments
             shortcut.WorkingDirectory = str(Path(cmd_path).parent)
-            shortcut.WindowStyle = 7  # Minimized, hidden
             shortcut.save()
         else:
             # Fallback: create shortcut using PowerShell
             ps_script = f'''
 $WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("{str(win_startup_script)}")
-$Shortcut.TargetPath = "{cmd_path}"
-$Shortcut.Arguments = "run"
-$Shortcut.WorkingDirectory = "{str(Path(cmd_path).parent)}"
-$Shortcut.WindowStyle = 7
+$Shortcut = $WshShell.CreateShortcut('{str(win_startup_script).replace("'", "''")}')
+$Shortcut.TargetPath = '{str(pythonw_path).replace("'", "''")}'
+$Shortcut.Arguments = '{launcher_arguments.replace("'", "''")}'
+$Shortcut.WorkingDirectory = '{str(Path(cmd_path).parent).replace("'", "''")}'
 $Shortcut.Save()
 '''
             sp.check_call(["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_script.strip()])
