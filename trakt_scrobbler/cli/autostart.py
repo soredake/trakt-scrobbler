@@ -85,17 +85,27 @@ def enable():
         sp.check_call(["systemctl", "--user", "enable", "trakt-scrobbler"])
     else:
         win_startup_script = get_autostart_serv_path()
-        pythonw_path = Path(sys.executable).with_name("pythonw.exe")
-        if not pythonw_path.is_file():
-            raise FileNotFoundError(f"Cannot find pythonw.exe at {pythonw_path}")
+        powershell_path = shutil.which("powershell")
+        if not powershell_path:
+            console.print("Cannot find PowerShell executable.", style="error")
+            raise typer.Exit(1)
 
-        run_command = sp.list2cmdline([cmd_path, "run"])
-        launcher_command = f'start "" /B {run_command}'
+        ps_cmd_path = cmd_path.replace("'", "''")
+        ps_working_directory = str(Path(cmd_path).parent).replace("'", "''")
         launcher_script = (
-            "import subprocess as sp; "
-            f"sp.Popen({launcher_command!r}, shell=True)"
+            f"Start-Process -FilePath '{ps_cmd_path}' -ArgumentList 'run' "
+            f"-WorkingDirectory '{ps_working_directory}' -WindowStyle Hidden"
         )
-        launcher_arguments = sp.list2cmdline(["-c", launcher_script])
+        launcher_arguments = sp.list2cmdline(
+            [
+                "-WindowStyle",
+                "Hidden",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                launcher_script,
+            ]
+        )
 
         try:
             import win32com.client
@@ -105,7 +115,7 @@ def enable():
         if win32com is not None:
             shell = win32com.client.Dispatch("WScript.Shell")
             shortcut = shell.CreateShortCut(str(win_startup_script))
-            shortcut.Targetpath = str(pythonw_path)
+            shortcut.Targetpath = powershell_path
             shortcut.Arguments = launcher_arguments
             shortcut.WorkingDirectory = str(Path(cmd_path).parent)
             shortcut.save()
@@ -114,7 +124,7 @@ def enable():
             ps_script = f'''
 $WshShell = New-Object -ComObject WScript.Shell
 $Shortcut = $WshShell.CreateShortcut('{str(win_startup_script).replace("'", "''")}')
-$Shortcut.TargetPath = '{str(pythonw_path).replace("'", "''")}'
+$Shortcut.TargetPath = '{powershell_path.replace("'", "''")}'
 $Shortcut.Arguments = '{launcher_arguments.replace("'", "''")}'
 $Shortcut.WorkingDirectory = '{str(Path(cmd_path).parent).replace("'", "''")}'
 $Shortcut.Save()
