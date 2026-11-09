@@ -55,6 +55,7 @@ class MPVMon(Monitor):
         self.sent_commands = {}
         self.command_counter = 1
         self.vars = {}
+        self.connected = False
 
     @classmethod
     def read_player_cfg(cls, auto_keys=None):
@@ -76,19 +77,44 @@ class MPVMon(Monitor):
 
     def run(self):
         while True:
-            if self.can_connect():
-                self.update_vars()
-                self.conn_loop()
-                if self.vars.get('state', 0) != 0:
-                    # create a 'stop' event in case the player didn't send 'end-file'
-                    self.vars['state'] = 0
-                    self.update_status()
+            try:
+                if self.can_connect():
+                    self.connected = True
+                    logger.debug(f"Connecting to MPV at {self.ipc_path}")
+                    self.update_vars()
+                    self.conn_loop()
+                    if self.vars.get('state', 0) != 0:
+                        # create a 'stop' event in case the player didn't send 'end-file'
+                        self.vars['state'] = 0
+                        self.update_status()
+                    self.vars = {}
+                    if self.poll_timer:
+                        self.poll_timer.cancel()
+                    time.sleep(self.restart_delay)
+                else:
+                    if self.connected:
+                        # Log the loss of an established connection once, so
+                        # users can see why monitoring stopped.
+                        logger.info(
+                            f'Lost connection to MPV at {self.ipc_path}. '
+                            f'Will retry in {self.poll_interval}s.'
+                        )
+                        self.connected = False
+                    else:
+                        logger.debug(
+                            f'Unable to connect to MPV at {self.ipc_path}. '
+                            f'Will retry in {self.poll_interval}s.'
+                        )
+                    time.sleep(self.poll_interval)
+            except Exception as e:
+                logger.exception(
+                    f"Unexpected error in MPV monitor: {e}. "
+                    f"Retrying in {self.poll_interval}s."
+                )
+                # Clean up any state
                 self.vars = {}
                 if self.poll_timer:
                     self.poll_timer.cancel()
-                time.sleep(self.restart_delay)
-            else:
-                logger.info('Unable to connect to MPV. Check ipc path.')
                 time.sleep(self.poll_interval)
 
     def update_status(self):
@@ -208,45 +234,69 @@ class MPVPosixMon(MPVMon):
     def conn_loop(self):
         sock = socket.socket(socket.AF_UNIX)
         try:
-            sock.connect(self.ipc_path)
-        except ConnectionRefusedError:
-            logger.warning("Connection refused. Maybe we retried too soon?")
-            return
-        self.is_running = True
-        sock_list = [sock]
-        while self.is_running:
-            r, _, _ = select.select(sock_list, [], [], self.read_timeout)
-            if r:  # r == [sock]
-                # socket has data to be read
+            try:
+                sock.connect(self.ipc_path)
+            except ConnectionRefusedError:
+                logger.warning("Connection refused. Maybe we retried too soon?")
+                return
+            except Exception as e:
+                logger.exception(f"Unexpected error connecting to MPV socket: {e}")
+                return
+            self.is_running = True
+            sock_list = [sock]
+            while self.is_running:
                 try:
-                    data = sock.recv(4096)
-                except ConnectionResetError:
+                    r, _, _ = select.select(sock_list, [], [], self.read_timeout)
+                    if r:  # r == [sock]
+                        # socket has data to be read
+                        try:
+                            data = sock.recv(4096)
+                        except ConnectionResetError:
+                            logger.debug("Connection reset by peer")
+                            self.is_running = False
+                            break
+                        except Exception as e:
+                            logger.exception(f"Error reading from socket: {e}")
+                            self.is_running = False
+                            break
+                        if len(data) == 0:
+                            # EOF reached
+                            logger.debug("EOF reached on socket")
+                            self.is_running = False
+                            break
+                        self.on_data(data)
+                    while not self.write_queue.empty():
+                        # block until sock can be written to
+                        _, w, _ = select.select([], sock_list, [], self.write_timeout)
+                        if not w:
+                            logger.warning("Timed out writing to socket. Killing connection.")
+                            self.is_running = False
+                            break
+                        try:
+                            sock.sendall(self.write_queue.get_nowait())
+                        except BrokenPipeError:
+                            logger.debug("Broken pipe on write")
+                            self.is_running = False
+                            break
+                        except Exception as e:
+                            logger.exception(f"Error writing to socket: {e}")
+                            self.is_running = False
+                            break
+                        else:
+                            self.write_queue.task_done()
+                except Exception as e:
+                    logger.exception(f"Unexpected error in conn_loop: {e}")
                     self.is_running = False
                     break
-                if len(data) == 0:
-                    # EOF reached
-                    self.is_running = False
-                    break
-                self.on_data(data)
-            while not self.write_queue.empty():
-                # block until sock can be written to
-                _, w, _ = select.select([], sock_list, [], self.write_timeout)
-                if not w:
-                    logger.warning("Timed out writing to socket. Killing connection.")
-                    self.is_running = False
-                    break
-                try:
-                    sock.sendall(self.write_queue.get_nowait())
-                except BrokenPipeError:
-                    self.is_running = False
-                    break
-                else:
+        finally:
+            self.is_running = False
+            try:
+                sock.close()
+            finally:
+                while not self.write_queue.empty():
+                    self.write_queue.get_nowait()
                     self.write_queue.task_done()
-        sock.close()
-        while not self.write_queue.empty():
-            self.write_queue.get_nowait()
-            self.write_queue.task_done()
-        logger.debug('Sock closed')
+                logger.debug('Sock closed')
 
 
 class MPVWinMon(MPVMon):
@@ -320,7 +370,11 @@ class MPVWinMon(MPVMon):
                     # racing with someone else? retry.
                     continue
                 else:
-                    raise
+                    logger.exception(f"Error creating pipe handle: {e}")
+                    return
+            except Exception as e:
+                logger.exception(f"Unexpected error creating pipe handle: {e}")
+                return
             else:
                 break
         else:
@@ -333,50 +387,68 @@ class MPVWinMon(MPVMon):
             self.file_handle = None
             return
 
-        # needed for blocking on read
-        overlapped = win32file.OVERLAPPED()
-        overlapped.hEvent = win32event.CreateEvent(None, 0, 0, None)
+        overlapped = None
+        try:
+            # needed for blocking on read
+            overlapped = win32file.OVERLAPPED()
+            overlapped.hEvent = win32event.CreateEvent(None, 0, 0, None)
 
-        # needed for transactions
-        win32pipe.SetNamedPipeHandleState(
-            self.file_handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
-        self.is_running = True
-        while self.is_running:
-            val = self._call(win32file.ReadFile, self.file_handle, self._read_buf, overlapped)
-            if not self.is_running:
-                break
-            err, data = val
-            if err != 0 and err != ERROR_IO_PENDING:
-                logger.warning(f"Unexpected read result {err}. Quitting.")
-                logger.debug(f"data={bytes(data)}")
-                self.is_running = False
-                break
-            if err == ERROR_IO_PENDING:
-                err = win32event.WaitForSingleObject(
-                    overlapped.hEvent, self.read_timeout)
+            # needed for transactions
+            win32pipe.SetNamedPipeHandleState(
+                self.file_handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
+            self.is_running = True
+            while self.is_running:
+                try:
+                    val = self._call(win32file.ReadFile, self.file_handle,
+                                     self._read_buf, overlapped)
+                    if not self.is_running:
+                        break
+                    err, data = val
+                    if err != 0 and err != ERROR_IO_PENDING:
+                        logger.warning(f"Unexpected read result {err}. Quitting.")
+                        logger.debug(f"data={bytes(data)}")
+                        self.is_running = False
+                        break
+                    if err == ERROR_IO_PENDING:
+                        err = win32event.WaitForSingleObject(
+                            overlapped.hEvent, self.read_timeout)
 
-            if err == win32event.WAIT_OBJECT_0:  # data is available
-                data = bytes(data)
-                line = data[:data.find(b"\n")]
-                self.on_line(line)
+                    if err == win32event.WAIT_OBJECT_0:  # data is available
+                        data = bytes(data)
+                        line = data[:data.find(b"\n")]
+                        self.on_line(line)
 
-            while not self.write_queue.empty():
-                # first see if mpv sent some data that needs to be read
-                data = self._call(self._read_all_data)
-                if not self.is_running:
+                    while not self.write_queue.empty():
+                        # first see if mpv sent some data that needs to be read
+                        data = self._call(self._read_all_data)
+                        if not self.is_running:
+                            break
+                        if data:
+                            self.on_data(data)
+                        # cancel all remaining reads/writes. Should be benign
+                        win32file.CancelIo(self.file_handle)
+
+                        write_data = self.write_queue.get_nowait()
+                        data = self._call(self._transact, write_data)
+                        if not self.is_running:
+                            break
+                        self.on_line(data[:-1])
+                except Exception as e:
+                    logger.exception(f"Unexpected error in conn_loop: {e}")
+                    self.is_running = False
                     break
-                if data:
-                    self.on_data(data)
-                # cancel all remaining reads/writes. Should be benign
-                win32file.CancelIo(self.file_handle)
-
-                write_data = self.write_queue.get_nowait()
-                data = self._call(self._transact, write_data)
-                if not self.is_running:
-                    break
-                self.on_line(data[:-1])
-
-        self.is_running = False
-        self.file_handle.close()
-        self.file_handle = None
-        logger.debug('Pipe closed.')
+        finally:
+            self.is_running = False
+            if self.file_handle:
+                try:
+                    self.file_handle.close()
+                except Exception:
+                    logger.exception("Error closing MPV pipe handle")
+                finally:
+                    self.file_handle = None
+            if overlapped is not None and overlapped.hEvent:
+                try:
+                    win32api.CloseHandle(overlapped.hEvent)
+                except Exception:
+                    logger.exception("Error closing MPV pipe event")
+            logger.debug('Pipe closed.')
